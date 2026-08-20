@@ -7,8 +7,8 @@
 | 类别 | 默认目录 | 内容与原因 |
 |---|---|---|
 | Program / Script | `/opt/sni-proxy` | 核心程序、管理脚本、Shell 模块、服务 Source of Truth、模板、版本和非敏感安装元数据。所有可更新程序内容集中在一个根目录。 |
-| Configuration | `/etc/sni-proxy` | 用户可修改的运行配置，独立于更新包。 |
-| Persistent Data | `/var/lib/sni-proxy` | 凭据哈希、凭据镜像、备份和其他持久状态。 |
+| Configuration | `/etc/sni-proxy` | root-owned 运行配置与发布公钥信任策略，服务用户只读。 |
+| Persistent Data | `/var/lib/sni-proxy` | Argon2id 凭据记录、备份和其他持久状态。 |
 | Logs | `/var/log/sni-proxy` | 服务日志，避免程序目录随更新或卸载策略混淆。 |
 
 `internal/config.Paths` 是 Go 侧唯一默认值来源；Shell 使用 `common.sh` 的同组统一默认变量。默认安装根为 `/opt/sni-proxy`，但实际目录通过可执行文件/Symlink 与 `install-meta.json` 解析，不能为了显示而写死。
@@ -20,12 +20,12 @@
 ├── cmd/sni-proxy/main.go          # 单一 CLI/服务入口
 ├── internal/
 │   ├── config/                    # 路径、运行配置、安装元数据与原子写入
-│   ├── credentials/               # 管理员哈希记录、随机密码与镜像
+│   ├── credentials/               # Argon2id 管理员记录与随机密码
 │   ├── network/                   # 端口试绑定、IP 发现、安全上游解析
 │   ├── platform/                  # 发行版、架构、包管理器、Init、容器检测
 │   ├── proxy/                     # HTTP Host 与 TLS SNI 转发
 │   ├── service/                   # ServiceManager 及四套 Adapter
-│   ├── update/                    # Release 检查、SHA-256、解包、切换和回滚
+│   ├── update/                    # SemVer、Ed25519 manifest、capability 与事务回滚
 │   └── web/                       # HTTP API、认证与内嵌 WebUI
 ├── scripts/
 │   ├── install.sh                 # POSIX/BusyBox 安装入口
@@ -113,7 +113,7 @@ Install / service_install
 Uninstall / service_uninstall
 ```
 
-Web Handler、端口重启、更新、管理菜单和卸载只调用此接口，不在上层写死 systemctl、rc-service 或 sv。
+Web Handler 只查询此接口；高权限服务、端口和更新写操作只由 root CLI 调用，不在网络进程中开放。
 
 ### Systemd Adapter
 
@@ -145,7 +145,7 @@ Docker、Podman、LXC、OpenVZ 或 containerd 只作为平台信息，不直接�
 
 ## 发行版支持矩阵
 
-“源码已实现”表示仓库中存在对应检测与 Adapter；因为本阶段明确不运行测试，不能等同于已经完成目标机实测。
+“源码已实现”表示仓库中存在对应检测与 Adapter；单元测试和容器构建不能等同于已经完成目标机安装到卸载实测。
 
 | Distribution | Package Manager | Default Init | Source Support | Runtime Validation |
 |---|---|---|---|---|
@@ -180,14 +180,14 @@ Docker、Podman、LXC、OpenVZ 或 containerd 只作为平台信息，不直接�
 }
 ```
 
-服务操作走 `service.Manager`；端口由 Go `net.Listen` 试绑定；IP 使用 `net.Interfaces` 与 UDP route probing；GitHub Release 使用 Go TLS/HTTP 与 `encoding/json`。服务器运行时不需要 Node.js、Python、jq、Go 或 Java。
+服务状态查询走 `service.Manager`；Web 服务、端口与更新写操作固定返回禁止。端口由 Go `net.Listen` 试绑定；IP 使用 `net.Interfaces` 与 UDP route probing；GitHub Release 使用 Go TLS/HTTP 与 `encoding/json`。服务器运行时不需要 Node.js、Python、jq、Go 或 Java。
 
 ## 更新与卸载
 
-单一 linux-amd64 更新包包含核心程序、管理脚本、全部 libexec 和 systemd/OpenRC/SysVinit/runit 模板。Go 更新器验证 TLS、包名、SHA-256、解压路径、文件类型与必需清单，按当前实际路径渲染服务模板，保留安装元数据，在同一文件系统切换安装目录并保留回滚副本。
+单一 linux-amd64 更新包包含核心程序、管理脚本、全部 libexec 和 systemd/OpenRC/SysVinit/runit 模板。Go 更新器先用 root-owned Ed25519 公钥验证覆盖整个 archive 的 manifest，再验证 SHA-256、解压路径、文件类型、ELF 架构、owner/mode 与低端口 capability。目录切换、服务注册、重启和三个端口 readiness 属于同一事务；失败会恢复旧目录、旧注册并健康检查旧版本。
 
-卸载从管理脚本的真实路径与安装 Metadata 获取目标，拒绝空值、`/`、常见系统根目录或缺少三项安装标记的目录。随后只调用当前 Init Adapter 停止、关闭自启和注销，删除两个外部 Symlink，再删除经过校验的程序、配置、数据与日志目录。
+卸载从管理脚本的真实路径与安装 Metadata 获取目标，拒绝非 canonical、越出角色允许空间、互相重叠或 marker/installation ID/owner/mode 不匹配的目录。随后只调用当前 Init Adapter 停止、关闭自启和注销，删除两个外部 Symlink，再删除四个经过验证的目录。
 
 ## 测试源码与未来验证
 
-仓库测试源码覆盖 os-release、Debian/Ubuntu/RHEL-like/Alpine/Arch/SUSE、四类 Init、八类包管理器、Adapter 命令、相对 Symlink、安装路径安全和版本比较。本源码阶段不执行这些测试。未来必须增加真实 Alpine amd64/OpenRC/BusyBox/musl 与至少一个 systemd 发行版的安装到卸载端到端验证。
+仓库测试覆盖 os-release、平台/Init、Adapter、Argon2id、deny-by-default 域名策略、special-use IP、HTTP 策略、TLS 分片/模糊测试、buffered-reader idle timeout、登录限制、签名 manifest、恶意 archive、SemVer 和回滚恢复。CI 执行 test/race/vet、Staticcheck、Govulncheck、静态 Linux 构建、ShellCheck 与 Alpine 构建；仍需增加真实 Alpine/OpenRC 与 systemd 安装到卸载 E2E。

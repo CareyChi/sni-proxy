@@ -8,6 +8,7 @@ SCRIPT_DIR=$(CDPATH= cd -P "$(dirname "$0")" 2>/dev/null && pwd -P) || exit 1
 PROJECT_DIR=$(dirname "$SCRIPT_DIR")
 SOURCE_BINARY=${1:-$PROJECT_DIR/bin/sni-proxy}
 OUTPUT_DIR=${2:-$PROJECT_DIR/dist}
+SIGNING_KEY_FILE=${SNI_PROXY_SIGNING_KEY_FILE:-}
 mkdir -p "$OUTPUT_DIR" || exit 1
 OUTPUT_DIR=$(CDPATH= cd "$OUTPUT_DIR" 2>/dev/null && pwd -P) || exit 1
 STAGE_DIR=$OUTPUT_DIR/sni-proxy-linux-amd64
@@ -43,4 +44,16 @@ else
     printf '缺少 sha256sum/shasum，无法生成校验文件\n' >&2
     exit 1
 fi
+command -v openssl >/dev/null 2>&1 || { printf '缺少 openssl，无法生成 Ed25519 签名\n' >&2; exit 1; }
+[ -f "$SIGNING_KEY_FILE" ] || { printf '必须通过 SNI_PROXY_SIGNING_KEY_FILE 提供 Ed25519 私钥\n' >&2; exit 1; }
+archive_name=$(basename "$archive")
+archive_sha=$(awk 'NR == 1 { print $1 }' "$archive.sha256")
+release_version=$(sed -n '1p' "$PROJECT_DIR/VERSION" | tr -d '\r\n')
+manifest=$OUTPUT_DIR/sni-proxy-linux-amd64.manifest.json
+signature=$manifest.sig
+printf '{"version":"%s","architecture":"amd64","archive":"%s","sha256":"%s"}\n' \
+    "$release_version" "$archive_name" "$archive_sha" > "$manifest" || exit 1
+openssl pkeyutl -sign -rawin -inkey "$SIGNING_KEY_FILE" -in "$manifest" -out "$signature.bin" || exit 1
+openssl base64 -A -in "$signature.bin" > "$signature" || exit 1
+rm -f "$signature.bin"
 printf 'Release layout ready: %s\n' "$archive"

@@ -5,33 +5,57 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
+const OfficialUpdateRepository = "CareyChi/sni-proxy"
+
 type Config struct {
-	HTTPPort         int      `json:"http_port"`
-	HTTPSPort        int      `json:"https_port"`
-	WebPort          int      `json:"web_port"`
-	ListenAddress    string   `json:"listen_address"`
-	AllowedDomains   []string `json:"allowed_domains,omitempty"`
-	AllowPrivate     bool     `json:"allow_private_upstreams"`
-	DialTimeout      string   `json:"dial_timeout"`
-	IdleTimeout      string   `json:"idle_timeout"`
-	UpdateRepository string   `json:"update_repository"`
+	HTTPPort           int      `json:"http_port"`
+	HTTPSPort          int      `json:"https_port"`
+	WebPort            int      `json:"web_port"`
+	ProxyListenAddress string   `json:"proxy_listen_address"`
+	AdminListenAddress string   `json:"admin_listen_address"`
+	AdminPublicURL     string   `json:"admin_public_url,omitempty"`
+	CookieSecure       bool     `json:"cookie_secure"`
+	AllowedDomains     []string `json:"allowed_domains"`
+	AllowPrivate       bool     `json:"allow_private_upstreams"`
+	DialTimeout        string   `json:"dial_timeout"`
+	IdleTimeout        string   `json:"idle_timeout"`
+	MaxConnections     int      `json:"max_connections"`
+	MaxConnectionsIP   int      `json:"max_connections_per_ip"`
+	UpdateRepository   string   `json:"update_repository"`
+
+	// ListenAddress is accepted only to migrate configurations written before
+	// the proxy and administration listeners were separated. It never controls
+	// the administration listener.
+	ListenAddress string `json:"listen_address,omitempty"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		HTTPPort:         80,
-		HTTPSPort:        443,
-		WebPort:          6866,
-		ListenAddress:    "0.0.0.0",
-		DialTimeout:      "10s",
-		IdleTimeout:      "5m",
-		UpdateRepository: "CareyChi/sni-proxy",
+		HTTPPort:           80,
+		HTTPSPort:          443,
+		WebPort:            6866,
+		ProxyListenAddress: "0.0.0.0",
+		AdminListenAddress: "127.0.0.1",
+		DialTimeout:        "10s",
+		IdleTimeout:        "5m",
+		MaxConnections:     1024,
+		MaxConnectionsIP:   32,
+		UpdateRepository:   OfficialUpdateRepository,
+	}
+}
+
+func (c *Config) migrateLegacy() {
+	if c.ListenAddress != "" {
+		c.ProxyListenAddress = c.ListenAddress
+		c.ListenAddress = ""
 	}
 }
 
@@ -47,8 +71,31 @@ func (c Config) Validate() error {
 		}
 		seen[port] = struct{}{}
 	}
-	if c.ListenAddress == "" || strings.ContainsAny(c.ListenAddress, "\r\n\x00") {
-		return errors.New("listen_address is invalid")
+	for name, address := range map[string]string{
+		"proxy_listen_address": c.ProxyListenAddress,
+		"admin_listen_address": c.AdminListenAddress,
+	} {
+		if address == "" || strings.ContainsAny(address, "\r\n\x00") || net.ParseIP(address) == nil {
+			return errors.New(name + " must be an IP address")
+		}
+	}
+	if c.MaxConnections < 1 || c.MaxConnections > 1_000_000 {
+		return errors.New("max_connections must be between 1 and 1000000")
+	}
+	if c.MaxConnectionsIP < 1 || c.MaxConnectionsIP > c.MaxConnections {
+		return errors.New("max_connections_per_ip must be positive and no larger than max_connections")
+	}
+	if c.AdminPublicURL != "" {
+		publicURL, err := url.Parse(c.AdminPublicURL)
+		if err != nil || !publicURL.IsAbs() || publicURL.Host == "" || (publicURL.Scheme != "http" && publicURL.Scheme != "https") || publicURL.User != nil || publicURL.RawQuery != "" || publicURL.Fragment != "" {
+			return errors.New("admin_public_url must be an absolute http(s) URL without credentials, query, or fragment")
+		}
+		if publicURL.Path != "" && publicURL.Path != "/" {
+			return errors.New("admin_public_url must not contain a path")
+		}
+		if publicURL.Scheme == "https" && !c.CookieSecure {
+			return errors.New("cookie_secure must be true when admin_public_url uses HTTPS")
+		}
 	}
 	for _, value := range []string{c.DialTimeout, c.IdleTimeout} {
 		duration, err := time.ParseDuration(value)
@@ -56,9 +103,8 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid duration %q", value)
 		}
 	}
-	parts := strings.Split(c.UpdateRepository, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(c.UpdateRepository, " \t\r\n") {
-		return errors.New("update_repository must use owner/name form")
+	if c.UpdateRepository != OfficialUpdateRepository {
+		return fmt.Errorf("update_repository is pinned to %s", OfficialUpdateRepository)
 	}
 	for _, domain := range c.AllowedDomains {
 		if strings.TrimSpace(domain) == "" || strings.ContainsAny(domain, "/:@\r\n\x00") {
@@ -83,6 +129,7 @@ func Load(path string) (Config, error) {
 	if err := decoder.Decode(&configuration); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
+	configuration.migrateLegacy()
 	if err := configuration.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -90,10 +137,14 @@ func Load(path string) (Config, error) {
 }
 
 func Save(path string, configuration Config) error {
+	configuration.migrateLegacy()
 	if err := configuration.Validate(); err != nil {
 		return err
 	}
-	return writeJSONAtomic(path, configuration, 0o600)
+	// Runtime configuration contains no secrets and is root-managed. World
+	// readability lets the unprivileged daemon load it without making the
+	// containing directory writable or trusting a service-owned file.
+	return writeJSONAtomic(path, configuration, 0o644)
 }
 
 func writeJSONAtomic(path string, value any, mode os.FileMode) error {
@@ -130,5 +181,5 @@ func writeJSONAtomic(path string, value any, mode os.FileMode) error {
 		return err
 	}
 	remove = false
-	return nil
+	return syncDirectory(filepath.Dir(path))
 }

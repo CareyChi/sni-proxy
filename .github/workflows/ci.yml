@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.13
+          cache: true
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/sni-proxy ./cmd/sni-proxy
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: POSIX syntax
+        run: |
+          find scripts service -type f \( -name '*.sh' -o -path 'scripts/sni-proxyctl' -o -path 'service/openrc/*' -o -path 'service/sysvinit/*' -o -path 'service/runit/*/run' \) -print0 |
+            xargs -0 -n1 sh -n
+      - name: ShellCheck
+        run: shellcheck -s sh scripts/*.sh scripts/sni-proxyctl scripts/lib/*.sh scripts/tests/*.sh service/openrc/sni-proxy service/sysvinit/sni-proxy service/runit/sni-proxy/run
+      - run: sudo sh scripts/tests/compatibility_test.sh
+
+  alpine-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Alpine 3.22 test and static build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src golang:1.25-alpine3.22 sh -ec '
+            apk add --no-cache build-base
+            test "$(go env GOVERSION)" = go1.25.13
+            go test ./...
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/sni-proxy ./cmd/sni-proxy
+          '

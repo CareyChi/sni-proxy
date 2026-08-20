@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -26,12 +28,12 @@ func CheckPort(host string, port int) PortCheck {
 		result.Reason = "port_out_of_range"
 		return result
 	}
-	listener, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
+	listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		result.Reason = classifyListenError(err)
 		return result
 	}
-	listener.Close()
+	_ = listener.Close()
 	result.Available = true
 	return result
 }
@@ -66,53 +68,56 @@ func ServerIPs() []string {
 }
 
 func DialUpstream(ctx context.Context, hostname string, port int, timeout time.Duration, allowPrivate bool, allowedDomains []string) (net.Conn, error) {
-	hostname = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
-	if !validHostname(hostname) || net.ParseIP(hostname) != nil {
+	hostname = NormalizeHostname(hostname)
+	if !ValidHostname(hostname) || net.ParseIP(hostname) != nil {
 		return nil, errors.New("upstream must be a valid DNS hostname")
 	}
-	if !domainAllowed(hostname, allowedDomains) {
+	if !DomainAllowed(hostname, allowedDomains) {
 		return nil, errors.New("upstream hostname is not allowed")
 	}
-	addresses, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+	if timeout <= 0 {
+		return nil, errors.New("upstream timeout must be positive")
+	}
+	budget, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupNetIP(budget, "ip", hostname)
 	if err != nil {
 		return nil, fmt.Errorf("resolve upstream: %w", err)
 	}
-	if len(addresses) == 0 {
-		return nil, errors.New("upstream hostname returned no addresses")
-	}
-	dialer := net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
-	var lastError error
+	eligible := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
-		if !allowPrivate && !isPublicAddress(address.IP) {
-			lastError = errors.New("upstream resolved to a non-public address")
-			continue
+		address = address.Unmap()
+		if isDialableAddress(address) && (allowPrivate || IsPublicAddress(address)) {
+			eligible = append(eligible, address)
 		}
-		connection, dialErr := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address.IP.String(), fmt.Sprintf("%d", port)))
-		if dialErr == nil {
-			return connection, nil
-		}
-		lastError = dialErr
 	}
-	if lastError == nil {
-		lastError = errors.New("no eligible upstream address")
+	if len(eligible) == 0 {
+		return nil, errors.New("upstream returned no policy-eligible addresses")
 	}
-	return nil, lastError
+	return dialHappyEyeballs(budget, eligible, port)
 }
 
-func domainAllowed(hostname string, allowed []string) bool {
+func NormalizeHostname(hostname string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+}
+
+// DomainAllowed is deliberately deny-by-default. A suffix entry permits the
+// exact domain and its subdomains, but never a merely similar string.
+func DomainAllowed(hostname string, allowed []string) bool {
+	hostname = NormalizeHostname(hostname)
 	if len(allowed) == 0 {
-		return true
+		return false
 	}
 	for _, candidate := range allowed {
-		candidate = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(candidate)), ".")
-		if hostname == candidate || strings.HasSuffix(hostname, "."+candidate) {
+		candidate = strings.TrimPrefix(NormalizeHostname(candidate), ".")
+		if candidate != "" && (hostname == candidate || strings.HasSuffix(hostname, "."+candidate)) {
 			return true
 		}
 	}
 	return false
 }
 
-func validHostname(hostname string) bool {
+func ValidHostname(hostname string) bool {
 	if len(hostname) < 1 || len(hostname) > 253 || strings.Contains(hostname, "..") {
 		return false
 	}
@@ -129,8 +134,121 @@ func validHostname(hostname string) bool {
 	return true
 }
 
-func isPublicAddress(address net.IP) bool {
-	return address.IsGlobalUnicast() && !address.IsPrivate() && !address.IsLoopback() && !address.IsUnspecified() && !address.IsLinkLocalUnicast() && !address.IsLinkLocalMulticast() && !address.IsMulticast()
+var specialUsePrefixes = mustPrefixes(
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+	"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+	"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	"::/128", "::1/128", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+	"2001::/23", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8",
+)
+
+func IsPublicAddress(address netip.Addr) bool {
+	if !isDialableAddress(address) {
+		return false
+	}
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() {
+		return false
+	}
+	for _, prefix := range specialUsePrefixes {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDialableAddress(address netip.Addr) bool {
+	return address.IsValid() && address.IsGlobalUnicast() && !address.IsUnspecified() && !address.IsMulticast()
+}
+
+func mustPrefixes(values ...string) []netip.Prefix {
+	result := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		result = append(result, netip.MustParsePrefix(value))
+	}
+	return result
+}
+
+func dialHappyEyeballs(ctx context.Context, addresses []netip.Addr, port int) (net.Conn, error) {
+	ordered := interleaveFamilies(addresses)
+	if len(ordered) > 8 {
+		ordered = ordered[:8]
+	}
+	type result struct {
+		connection net.Conn
+		err        error
+	}
+	results := make(chan result, len(ordered))
+	dialContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for index, address := range ordered {
+		index, address := index, address
+		go func() {
+			if index > 0 {
+				timer := time.NewTimer(time.Duration(index) * 200 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-dialContext.Done():
+					results <- result{err: dialContext.Err()}
+					return
+				case <-timer.C:
+				}
+			}
+			dialer := net.Dialer{KeepAlive: 30 * time.Second}
+			connection, err := dialer.DialContext(dialContext, "tcp", net.JoinHostPort(address.String(), strconv.Itoa(port)))
+			results <- result{connection: connection, err: err}
+		}()
+	}
+	var lastError error
+	for received := 0; received < len(ordered); received++ {
+		attempt := <-results
+		if attempt.err == nil {
+			cancel()
+			remaining := len(ordered) - received - 1
+			go func() {
+				for index := 0; index < remaining; index++ {
+					late := <-results
+					if late.connection != nil {
+						late.connection.Close()
+					}
+				}
+			}()
+			return attempt.connection, nil
+		}
+		if !errors.Is(attempt.err, context.Canceled) {
+			lastError = attempt.err
+		}
+	}
+	if lastError == nil {
+		lastError = ctx.Err()
+	}
+	if lastError == nil {
+		lastError = errors.New("no eligible upstream address could be reached")
+	}
+	return nil, lastError
+}
+
+func interleaveFamilies(addresses []netip.Addr) []netip.Addr {
+	v6, v4 := make([]netip.Addr, 0), make([]netip.Addr, 0)
+	for _, address := range addresses {
+		if address.Unmap().Is4() {
+			v4 = append(v4, address.Unmap())
+		} else {
+			v6 = append(v6, address)
+		}
+	}
+	result := make([]netip.Addr, 0, len(addresses))
+	for len(v6) > 0 || len(v4) > 0 {
+		if len(v6) > 0 {
+			result, v6 = append(result, v6[0]), v6[1:]
+		}
+		if len(v4) > 0 {
+			result, v4 = append(result, v4[0]), v4[1:]
+		}
+	}
+	return result
 }
 
 func routeProbeIP() string {

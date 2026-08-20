@@ -7,9 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,10 +22,12 @@ import (
 	"github.com/CareyChi/sni-proxy/internal/credentials"
 	proxynetwork "github.com/CareyChi/sni-proxy/internal/network"
 	"github.com/CareyChi/sni-proxy/internal/platform"
+	"github.com/CareyChi/sni-proxy/internal/privilege"
 	proxyserver "github.com/CareyChi/sni-proxy/internal/proxy"
 	"github.com/CareyChi/sni-proxy/internal/service"
 	updateclient "github.com/CareyChi/sni-proxy/internal/update"
 	webserver "github.com/CareyChi/sni-proxy/internal/web"
+	"golang.org/x/term"
 )
 
 var version = "dev"
@@ -142,8 +147,9 @@ func showInfo(paths config.Paths, arguments []string) error {
 	}
 	data := map[string]any{
 		"platform": info, "version": effectiveVersion(paths), "addresses": proxynetwork.ServerIPs(),
-		"ports": map[string]int{"http": configuration.HTTPPort, "https": configuration.HTTPSPort, "web": configuration.WebPort},
-		"service": map[string]any{"running": running, "running_known": runningKnown, "enabled": enabled, "enabled_known": enabledKnown},
+		"ports":     map[string]int{"http": configuration.HTTPPort, "https": configuration.HTTPSPort, "web": configuration.WebPort},
+		"listeners": map[string]string{"proxy": configuration.ProxyListenAddress, "admin": configuration.AdminListenAddress},
+		"service":   map[string]any{"running": running, "running_known": runningKnown, "enabled": enabled, "enabled_known": enabledKnown},
 	}
 	if *asJSON {
 		encoder := json.NewEncoder(os.Stdout)
@@ -158,9 +164,7 @@ func showInfo(paths config.Paths, arguments []string) error {
 	fmt.Printf("安装目录：%s\n", info.InstallDir)
 	fmt.Printf("程序版本：%s\n", effectiveVersion(paths))
 	fmt.Printf("HTTP/HTTPS/Web：%d/%d/%d\n", configuration.HTTPPort, configuration.HTTPSPort, configuration.WebPort)
-	for _, address := range proxynetwork.ServerIPs() {
-		fmt.Printf("后台地址：http://%s:%d\n", address, configuration.WebPort)
-	}
+	fmt.Printf("后台地址：%s\n", adminURL(configuration))
 	return nil
 }
 
@@ -177,7 +181,7 @@ func health(paths config.Paths, arguments []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/healthz", configuration.WebPort), nil)
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, adminHealthURL(configuration), nil)
 	response, err := http.DefaultClient.Do(request)
 	healthy := err == nil && response.StatusCode == http.StatusOK
 	if response != nil {
@@ -185,7 +189,7 @@ func health(paths config.Paths, arguments []string) error {
 		response.Body.Close()
 	}
 	if *asJSON {
-		json.NewEncoder(os.Stdout).Encode(map[string]any{"healthy": healthy, "web_port": configuration.WebPort})
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"healthy": healthy, "web_port": configuration.WebPort, "address": adminHealthHost(configuration)})
 	} else if healthy {
 		fmt.Println("healthy")
 	}
@@ -225,10 +229,15 @@ func configCommand(paths config.Paths, arguments []string) error {
 			return encoder.Encode(configuration)
 		}
 	case "set-ports":
+		if err := privilege.RequireRoot(); err != nil {
+			return err
+		}
 		flags := flag.NewFlagSet("config set-ports", flag.ContinueOnError)
 		httpPort := flags.Int("http", 0, "HTTP port")
 		httpsPort := flags.Int("https", 0, "HTTPS port")
 		webPort := flags.Int("web", 0, "Web port")
+		allowedDomains := flags.String("allow-domains", "", "comma-separated upstream domain allowlist")
+		initialize := flags.Bool("initialize", false, "initialize a new configuration without restarting a service")
 		if err := flags.Parse(arguments[1:]); err != nil {
 			return err
 		}
@@ -236,8 +245,21 @@ func configCommand(paths config.Paths, arguments []string) error {
 		if err != nil {
 			return err
 		}
-		configuration.HTTPPort, configuration.HTTPSPort, configuration.WebPort = *httpPort, *httpsPort, *webPort
-		return config.Save(paths.ConfigFile(), configuration)
+		updated := configuration
+		updated.HTTPPort, updated.HTTPSPort, updated.WebPort = *httpPort, *httpsPort, *webPort
+		if *allowedDomains != "" {
+			updated.AllowedDomains = nil
+			for _, domain := range strings.Split(*allowedDomains, ",") {
+				updated.AllowedDomains = append(updated.AllowedDomains, strings.TrimSpace(domain))
+			}
+		}
+		if *initialize {
+			if _, statErr := os.Stat(paths.ConfigFile()); !errors.Is(statErr, os.ErrNotExist) {
+				return errors.New("--initialize is allowed only when the configuration file does not exist")
+			}
+			return config.Save(paths.ConfigFile(), updated)
+		}
+		return setPortsTransaction(paths, configuration, updated)
 	}
 	return errors.New("unknown config operation")
 }
@@ -258,16 +280,22 @@ func adminCommand(paths config.Paths, arguments []string) error {
 	case "init", "reset-credentials":
 		flags := flag.NewFlagSet("admin "+arguments[0], flag.ContinueOnError)
 		username := flags.String("username", "admin", "administrator username")
-		password := flags.String("password", "", "administrator password; empty generates one")
+		password := flags.String("password", "", "administrator password (unsafe: visible in argv)")
+		passwordFile := flags.String("password-file", "", "read administrator password from a file")
+		passwordStdin := flags.Bool("password-stdin", false, "read administrator password from stdin")
+		generate := flags.Bool("generate", false, "generate a random administrator password")
 		if err := flags.Parse(arguments[1:]); err != nil {
 			return err
 		}
+		resolvedPassword, err := readAdminPassword(arguments[0], *password, *passwordFile, *passwordStdin, *generate)
+		if err != nil {
+			return err
+		}
 		var generated string
-		var err error
 		if arguments[0] == "init" {
-			generated, err = store.Initialize(*username, *password)
+			generated, err = store.Initialize(*username, resolvedPassword)
 		} else {
-			generated, err = store.Reset(*username, *password)
+			generated, err = store.Reset(*username, resolvedPassword)
 		}
 		if err != nil {
 			return err
@@ -350,6 +378,12 @@ func serviceCommand(paths config.Paths, arguments []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	switch arguments[0] {
+	case "start", "stop", "restart", "enable", "disable", "install", "uninstall":
+		if err := privilege.RequireRoot(); err != nil {
+			return err
+		}
+	}
+	switch arguments[0] {
 	case "start":
 		return manager.Start(ctx)
 	case "stop":
@@ -417,33 +451,221 @@ func updateCommand(paths config.Paths, arguments []string) error {
 	if arguments[0] != "apply" || *requestedVersion == "" || *requestedVersion != result.Latest {
 		return errors.New("apply requires --version matching the latest checked release")
 	}
+	if err := privilege.RequireRoot(); err != nil {
+		return err
+	}
+	_, publicKey, err := config.LoadUpdateTrust(paths.UpdateTrustFile())
+	if err != nil {
+		return fmt.Errorf("load root-owned update trust policy: %w", err)
+	}
 	_, manager, detectErr := detectRuntime(paths)
 	if detectErr != nil {
 		return detectErr
 	}
-	if err := client.Apply(context.Background(), updateclient.ApplyOptions{Paths: paths, Release: result.Release, Manager: manager}); err != nil {
+	if err := client.Apply(context.Background(), updateclient.ApplyOptions{Paths: paths, Release: result.Release, Manager: manager, PublicKey: publicKey}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readAdminPassword(operation, inline, passwordFile string, passwordStdin, generate bool) (string, error) {
+	modes := 0
+	if inline != "" {
+		modes++
+	}
+	if passwordFile != "" {
+		modes++
+	}
+	if passwordStdin {
+		modes++
+	}
+	if generate {
+		modes++
+	}
+	if modes > 1 {
+		return "", errors.New("choose exactly one of --password, --password-file, --password-stdin, or --generate")
+	}
+	if inline != "" {
+		fmt.Fprintln(os.Stderr, "警告：--password 会暴露在进程参数和 shell history 中；请优先使用隐藏输入、--password-file 或 --password-stdin。")
+		return inline, nil
+	}
+	if generate {
+		return "", nil
+	}
+	if passwordFile != "" {
+		path := filepath.Clean(passwordFile)
+		info, err := os.Stat(path)
+		if err != nil {
+			return "", err
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return "", errors.New("password file must be regular and accessible only to its owner")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		return readPasswordValue(io.LimitReader(file, 257))
+	}
+	if passwordStdin {
+		return readPasswordValue(io.LimitReader(os.Stdin, 257))
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", errors.New("no interactive terminal; use --password-file, --password-stdin, or --generate")
+	}
+	fmt.Fprint(os.Stderr, "请输入管理员密码：")
+	first, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	fmt.Fprint(os.Stderr, "请再次输入管理员密码：")
+	second, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	if string(first) != string(second) {
+		return "", errors.New("password confirmation does not match")
+	}
+	if operation == "init" && len(first) == 0 {
+		return "", errors.New("empty password is not allowed; use --generate explicitly")
+	}
+	return string(first), nil
+}
+
+func readPasswordValue(reader io.Reader) (string, error) {
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	if len(content) > 256 {
+		return "", errors.New("password exceeds 256 bytes")
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(content), "\n"), "\r")
+	if strings.ContainsRune(value, '\x00') {
+		return "", errors.New("password contains NUL")
+	}
+	return value, nil
+}
+
+func setPortsTransaction(paths config.Paths, previous, updated config.Config) error {
+	if err := updated.Validate(); err != nil {
+		return err
+	}
+	checks := []struct {
+		address   string
+		old, next int
+	}{
+		{updated.ProxyListenAddress, previous.HTTPPort, updated.HTTPPort},
+		{updated.ProxyListenAddress, previous.HTTPSPort, updated.HTTPSPort},
+		{updated.AdminListenAddress, previous.WebPort, updated.WebPort},
+	}
+	oldPorts := map[int]bool{previous.HTTPPort: true, previous.HTTPSPort: true, previous.WebPort: true}
+	for _, candidate := range checks {
+		if candidate.old != candidate.next && !oldPorts[candidate.next] {
+			check := proxynetwork.CheckPort(candidate.address, candidate.next)
+			if !check.Available {
+				return fmt.Errorf("port %d is unavailable: %s", candidate.next, check.Reason)
+			}
+		}
+	}
+	_, manager, err := detectRuntime(paths)
+	if err != nil {
 		return err
 	}
 	if manager == nil {
-		return errors.New("update files installed, but no supported service manager is available for restart")
+		return errors.New("a supported service manager is required to change ports transactionally")
 	}
-	restartContext, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	if err := config.Save(paths.ConfigFile(), updated); err != nil {
+		return err
+	}
+	operationContext, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if err := manager.Restart(restartContext); err != nil {
-		return fmt.Errorf("update files installed, but service restart failed: %w", err)
+	transactionErr := manager.Restart(operationContext)
+	if transactionErr == nil {
+		transactionErr = waitForConfigReadiness(operationContext, updated, 30*time.Second)
 	}
-	return waitForHealth(paths, 30*time.Second)
+	if transactionErr == nil {
+		return nil
+	}
+	rollbackErrors := []error{config.Save(paths.ConfigFile(), previous)}
+	rollbackContext, rollbackCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer rollbackCancel()
+	if restartErr := manager.Restart(rollbackContext); restartErr != nil {
+		rollbackErrors = append(rollbackErrors, restartErr)
+	} else if healthErr := waitForConfigReadiness(rollbackContext, previous, 30*time.Second); healthErr != nil {
+		rollbackErrors = append(rollbackErrors, healthErr)
+	}
+	rollbackErr := errors.Join(rollbackErrors...)
+	if rollbackErr != nil {
+		return fmt.Errorf("port change failed and rollback failed: change=%v; rollback=%v", transactionErr, rollbackErr)
+	}
+	return fmt.Errorf("port change failed; previous ports were restored: %w", transactionErr)
 }
 
-func waitForHealth(paths config.Paths, timeout time.Duration) error {
+func waitForConfigReadiness(ctx context.Context, configuration config.Config, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if err := health(paths, []string{"--timeout", "2s"}); err == nil {
+		if err := probeConfiguration(ctx, configuration); err == nil {
 			return nil
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
-	return errors.New("updated service did not become healthy before the deadline; rollback backup was preserved")
+	return errors.New("service did not become ready before the deadline")
+}
+
+func probeConfiguration(ctx context.Context, configuration config.Config) error {
+	requestContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	request, _ := http.NewRequestWithContext(requestContext, http.MethodGet, adminHealthURL(configuration), nil)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("admin health returned %s", response.Status)
+	}
+	proxyHost := dialableHost(configuration.ProxyListenAddress)
+	for _, port := range []int{configuration.HTTPPort, configuration.HTTPSPort} {
+		connection, err := (&net.Dialer{Timeout: 2 * time.Second}).DialContext(requestContext, "tcp", net.JoinHostPort(proxyHost, strconv.Itoa(port)))
+		if err != nil {
+			return err
+		}
+		connection.Close()
+	}
+	return nil
+}
+
+func dialableHost(host string) string {
+	if host == "0.0.0.0" {
+		return "127.0.0.1"
+	}
+	if host == "::" {
+		return "::1"
+	}
+	return host
+}
+
+func adminHealthHost(configuration config.Config) string {
+	return dialableHost(configuration.AdminListenAddress)
+}
+
+func adminHealthURL(configuration config.Config) string {
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(adminHealthHost(configuration), strconv.Itoa(configuration.WebPort)), Path: "/healthz"}).String()
+}
+
+func adminURL(configuration config.Config) string {
+	if configuration.AdminPublicURL != "" {
+		return configuration.AdminPublicURL
+	}
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(adminHealthHost(configuration), strconv.Itoa(configuration.WebPort))}).String()
 }
 
 func detectRuntime(paths config.Paths) (platform.Info, service.Manager, error) {
@@ -478,7 +700,13 @@ func configValue(configuration config.Config, key string) (string, bool) {
 	case "web_port":
 		return strconv.Itoa(configuration.WebPort), true
 	case "listen_address":
-		return configuration.ListenAddress, true
+		return configuration.ProxyListenAddress, true
+	case "proxy_listen_address":
+		return configuration.ProxyListenAddress, true
+	case "admin_listen_address":
+		return configuration.AdminListenAddress, true
+	case "cookie_secure":
+		return strconv.FormatBool(configuration.CookieSecure), true
 	case "update_repository":
 		return configuration.UpdateRepository, true
 	default:

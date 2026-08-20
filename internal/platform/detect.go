@@ -236,8 +236,11 @@ func (detector Detector) hasCommand(command string) bool {
 func compatibilityFor(id string) string {
 	switch strings.ToLower(id) {
 	case "debian", "ubuntu", "linuxmint", "pop", "kali", "rhel", "rocky", "almalinux", "centos", "ol", "fedora", "opensuse-leap", "opensuse-tumbleweed", "sles", "arch", "manjaro", "endeavouros", "alpine", "gentoo", "devuan", "void":
-		return "verified"
+		return "targeted"
 	default:
+		if id != "" && id != "unknown" {
+			return "recognized"
+		}
 		return "generic"
 	}
 }

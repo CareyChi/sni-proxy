@@ -7,10 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,13 @@ type session struct {
 	ExpiresAt time.Time
 }
 
+type loginState struct {
+	Tokens       float64
+	LastRefill   time.Time
+	Failures     int
+	BlockedUntil time.Time
+}
+
 type Server struct {
 	Paths       config.Paths
 	Credentials credentials.Store
@@ -45,6 +54,9 @@ type Server struct {
 	configMu      sync.RWMutex
 	sessions      map[string]session
 	sessionMu     sync.Mutex
+	loginAttempts map[string]loginState
+	loginMu       sync.Mutex
+	verifySlots   chan struct{}
 }
 
 func NewServer(paths config.Paths, configuration config.Config, info platform.Info, manager service.Manager, version string) *Server {
@@ -57,13 +69,15 @@ func NewServer(paths config.Paths, configuration config.Config, info platform.In
 		StartedAt:     time.Now(),
 		configuration: configuration,
 		sessions:      make(map[string]session),
+		loginAttempts: make(map[string]loginState),
+		verifySlots:   make(chan struct{}, 4),
 	}
 }
 
 func (server *Server) Serve(ctx context.Context) error {
 	configuration := server.currentConfig()
 	httpServer := &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", configuration.ListenAddress, configuration.WebPort),
+		Addr:              net.JoinHostPort(configuration.AdminListenAddress, strconv.Itoa(configuration.WebPort)),
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -139,7 +153,7 @@ func (server *Server) handleLogin(writer http.ResponseWriter, request *http.Requ
 		methodNotAllowed(writer, http.MethodPost)
 		return
 	}
-	if !isJSON(request) || !sameOrigin(request) {
+	if !isJSON(request) || !server.sameOrigin(request) {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 		return
 	}
@@ -151,11 +165,27 @@ func (server *Server) handleLogin(writer http.ResponseWriter, request *http.Requ
 		writeError(writer, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
+	clientAddress := remoteIP(request.RemoteAddr)
+	if wait, allowed := server.allowLoginAttempt(clientAddress, time.Now()); !allowed {
+		writer.Header().Set("Retry-After", strconv.Itoa(int(wait.Round(time.Second)/time.Second)+1))
+		writeError(writer, http.StatusTooManyRequests, "login_rate_limited", "登录尝试过多，请稍后重试")
+		return
+	}
+	select {
+	case server.verifySlots <- struct{}{}:
+		defer func() { <-server.verifySlots }()
+	default:
+		writer.Header().Set("Retry-After", "1")
+		writeError(writer, http.StatusTooManyRequests, "login_busy", "登录验证繁忙，请稍后重试")
+		return
+	}
 	valid, err := server.Credentials.Verify(input.Username, input.Password)
 	if err != nil || !valid {
+		server.recordLoginFailure(clientAddress, time.Now())
 		writeError(writer, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
+	server.recordLoginSuccess(clientAddress)
 	tokenBytes := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, tokenBytes); err != nil {
 		writeError(writer, http.StatusInternalServerError, "session_failed", "无法创建安全会话")
@@ -165,11 +195,12 @@ func (server *Server) handleLogin(writer http.ResponseWriter, request *http.Requ
 	expires := time.Now().Add(12 * time.Hour)
 	server.sessionMu.Lock()
 	server.pruneSessionsLocked(time.Now())
+	server.limitSessionsLocked(63)
 	server.sessions[token] = session{Username: input.Username, ExpiresAt: expires}
 	server.sessionMu.Unlock()
 	http.SetCookie(writer, &http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", HttpOnly: true,
-		SameSite: http.SameSiteStrictMode, Secure: request.TLS != nil, Expires: expires,
+		SameSite: http.SameSiteStrictMode, Secure: server.currentConfig().CookieSecure, Expires: expires,
 	})
 	writeData(writer, http.StatusOK, map[string]any{"username": input.Username, "expires_at": expires})
 }
@@ -188,7 +219,7 @@ func (server *Server) handleLogout(writer http.ResponseWriter, request *http.Req
 		methodNotAllowed(writer, http.MethodPost)
 		return
 	}
-	if !isJSON(request) || !sameOrigin(request) {
+	if !isJSON(request) || !server.sameOrigin(request) {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 		return
 	}
@@ -197,7 +228,7 @@ func (server *Server) handleLogout(writer http.ResponseWriter, request *http.Req
 		delete(server.sessions, cookie.Value)
 		server.sessionMu.Unlock()
 	}
-	http.SetCookie(writer, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(writer, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, Secure: server.currentConfig().CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	writeData(writer, http.StatusOK, true)
 }
 
@@ -222,6 +253,7 @@ func (server *Server) handleStatus(writer http.ResponseWriter, request *http.Req
 		"https_port": configuration.HTTPSPort, "web_port": configuration.WebPort,
 		"install_dir": server.Paths.InstallDir, "system": server.Platform.Distribution,
 		"system_version": server.Platform.DistributionVersion, "init_system": server.Platform.InitSystem,
+		"privileged_operations": false,
 	})
 }
 
@@ -255,58 +287,11 @@ func (server *Server) handlePorts(writer http.ResponseWriter, request *http.Requ
 		configuration := server.currentConfig()
 		writeData(writer, http.StatusOK, map[string]int{"http_port": configuration.HTTPPort, "https_port": configuration.HTTPSPort, "web_port": configuration.WebPort})
 	case http.MethodPut:
-		if !isJSON(request) || !sameOrigin(request) {
+		if !isJSON(request) || !server.sameOrigin(request) {
 			writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 			return
 		}
-		var input struct {
-			HTTPPort  int `json:"http_port"`
-			HTTPSPort int `json:"https_port"`
-			WebPort   int `json:"web_port"`
-		}
-		if err := decodeJSON(request, &input); err != nil {
-			writeError(writer, http.StatusBadRequest, "invalid_json", err.Error())
-			return
-		}
-		oldConfiguration := server.currentConfig()
-		newConfiguration := oldConfiguration
-		newConfiguration.HTTPPort = input.HTTPPort
-		newConfiguration.HTTPSPort = input.HTTPSPort
-		newConfiguration.WebPort = input.WebPort
-		if err := newConfiguration.Validate(); err != nil {
-			writeError(writer, http.StatusBadRequest, "invalid_ports", err.Error())
-			return
-		}
-		for _, candidate := range []struct{ old, next int }{{oldConfiguration.HTTPPort, input.HTTPPort}, {oldConfiguration.HTTPSPort, input.HTTPSPort}, {oldConfiguration.WebPort, input.WebPort}} {
-			if candidate.old != candidate.next {
-				check := proxynetwork.CheckPort(oldConfiguration.ListenAddress, candidate.next)
-				if !check.Available {
-					writeError(writer, http.StatusConflict, "port_unavailable", fmt.Sprintf("port %d is unavailable: %s", candidate.next, check.Reason))
-					return
-				}
-			}
-		}
-		if err := config.Save(server.Paths.ConfigFile(), newConfiguration); err != nil {
-			writeError(writer, http.StatusInternalServerError, "config_write_failed", err.Error())
-			return
-		}
-		if server.Manager == nil {
-			config.Save(server.Paths.ConfigFile(), oldConfiguration)
-			writeError(writer, http.StatusServiceUnavailable, "service_manager_unavailable", "未检测到可用的服务管理器")
-			return
-		}
-		server.configMu.Lock()
-		server.configuration = newConfiguration
-		server.configMu.Unlock()
-		if err := server.Manager.Restart(request.Context()); err != nil {
-			config.Save(server.Paths.ConfigFile(), oldConfiguration)
-			server.configMu.Lock()
-			server.configuration = oldConfiguration
-			server.configMu.Unlock()
-			writeError(writer, http.StatusInternalServerError, "restart_failed", err.Error())
-			return
-		}
-		writeData(writer, http.StatusOK, map[string]any{"http_port": input.HTTPPort, "https_port": input.HTTPSPort, "web_port": input.WebPort, "restart_requested": true})
+		writeError(writer, http.StatusForbidden, "privileged_operation_disabled", "Web 后台不执行端口变更；请以 root 使用 sni-proxy config set-ports")
 	default:
 		methodNotAllowed(writer, http.MethodGet+", "+http.MethodPut)
 	}
@@ -342,7 +327,7 @@ func (server *Server) handleCredentials(writer http.ResponseWriter, request *htt
 		}
 		writeData(writer, http.StatusOK, map[string]string{"username": username})
 	case http.MethodPut:
-		if !isJSON(request) || !sameOrigin(request) {
+		if !isJSON(request) || !server.sameOrigin(request) {
 			writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 			return
 		}
@@ -373,36 +358,11 @@ func (server *Server) handleService(writer http.ResponseWriter, request *http.Re
 		methodNotAllowed(writer, http.MethodPost)
 		return
 	}
-	if !isJSON(request) || !sameOrigin(request) {
+	if !isJSON(request) || !server.sameOrigin(request) {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 		return
 	}
-	if server.Manager == nil {
-		writeError(writer, http.StatusServiceUnavailable, "service_manager_unavailable", "当前环境未检测到受支持的服务管理器")
-		return
-	}
-	action := strings.TrimPrefix(request.URL.Path, "/api/v1/service/")
-	var err error
-	switch action {
-	case "start":
-		err = server.Manager.Start(request.Context())
-	case "stop":
-		err = server.Manager.Stop(request.Context())
-	case "restart":
-		err = server.Manager.Restart(request.Context())
-	case "enable":
-		err = server.Manager.Enable(request.Context())
-	case "disable":
-		err = server.Manager.Disable(request.Context())
-	default:
-		writeError(writer, http.StatusNotFound, "not_found", "unknown service action")
-		return
-	}
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "service_action_failed", err.Error())
-		return
-	}
-	writeData(writer, http.StatusOK, map[string]any{"action": action, "accepted": true})
+	writeError(writer, http.StatusForbidden, "privileged_operation_disabled", "Web 后台不执行服务管理操作；请以 root 使用 sni-proxy service")
 }
 
 func (server *Server) handleUpdateCheck(writer http.ResponseWriter, request *http.Request) {
@@ -414,7 +374,9 @@ func (server *Server) handleUpdateCheck(writer http.ResponseWriter, request *htt
 		writeError(writer, http.StatusBadRequest, "invalid_request", "JSON request required")
 		return
 	}
-	var input struct{ Channel string `json:"channel"` }
+	var input struct {
+		Channel string `json:"channel"`
+	}
 	if err := decodeJSON(request, &input); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_json", err.Error())
 		return
@@ -433,42 +395,11 @@ func (server *Server) handleUpdateApply(writer http.ResponseWriter, request *htt
 		methodNotAllowed(writer, http.MethodPost)
 		return
 	}
-	if !isJSON(request) || !sameOrigin(request) {
+	if !isJSON(request) || !server.sameOrigin(request) {
 		writeError(writer, http.StatusBadRequest, "invalid_request", "a same-origin JSON request is required")
 		return
 	}
-	var input struct {
-		Version string `json:"version"`
-		Channel string `json:"channel"`
-	}
-	if err := decodeJSON(request, &input); err != nil {
-		writeError(writer, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-	client := updateclient.NewClient(server.currentConfig().UpdateRepository)
-	result, err := client.Check(request.Context(), server.Version, input.Channel)
-	if err != nil {
-		writeError(writer, http.StatusBadGateway, "update_check_failed", err.Error())
-		return
-	}
-	if input.Version == "" || input.Version != result.Latest {
-		writeError(writer, http.StatusConflict, "version_changed", "requested version is not the current release candidate")
-		return
-	}
-	err = client.Apply(request.Context(), updateclient.ApplyOptions{Paths: server.Paths, Release: result.Release, Manager: server.Manager})
-	if err != nil {
-		writeError(writer, http.StatusInternalServerError, "update_failed", err.Error())
-		return
-	}
-	writeData(writer, http.StatusAccepted, map[string]any{"version": input.Version, "restart_requested": server.Manager != nil})
-	if server.Manager != nil {
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			restartContext, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			defer cancel()
-			server.Manager.Restart(restartContext)
-		}()
-	}
+	writeError(writer, http.StatusForbidden, "privileged_operation_disabled", "Web 后台不执行更新；请以 root 使用 sni-proxy update apply")
 }
 
 func (server *Server) requireAuthentication(next http.Handler) http.Handler {
@@ -511,6 +442,84 @@ func (server *Server) pruneSessionsLocked(now time.Time) {
 	}
 }
 
+func (server *Server) limitSessionsLocked(maximum int) {
+	for len(server.sessions) > maximum {
+		oldestToken := ""
+		var oldestExpiry time.Time
+		for token, current := range server.sessions {
+			if oldestToken == "" || current.ExpiresAt.Before(oldestExpiry) {
+				oldestToken, oldestExpiry = token, current.ExpiresAt
+			}
+		}
+		delete(server.sessions, oldestToken)
+	}
+}
+
+func remoteIP(remoteAddress string) string {
+	host, _, err := net.SplitHostPort(remoteAddress)
+	if err == nil {
+		return host
+	}
+	return remoteAddress
+}
+
+func (server *Server) allowLoginAttempt(address string, now time.Time) (time.Duration, bool) {
+	server.loginMu.Lock()
+	defer server.loginMu.Unlock()
+	if len(server.loginAttempts) >= 4096 {
+		for key, candidate := range server.loginAttempts {
+			if now.Sub(candidate.LastRefill) > time.Hour {
+				delete(server.loginAttempts, key)
+			}
+		}
+		if len(server.loginAttempts) >= 4096 {
+			return time.Minute, false
+		}
+	}
+	state, exists := server.loginAttempts[address]
+	if !exists {
+		state = loginState{Tokens: 5, LastRefill: now}
+	}
+	if now.Before(state.BlockedUntil) {
+		return state.BlockedUntil.Sub(now), false
+	}
+	state.Tokens += now.Sub(state.LastRefill).Seconds() / 30
+	if state.Tokens > 5 {
+		state.Tokens = 5
+	}
+	state.LastRefill = now
+	if state.Tokens < 1 {
+		server.loginAttempts[address] = state
+		return time.Duration((1 - state.Tokens) * 30 * float64(time.Second)), false
+	}
+	state.Tokens--
+	server.loginAttempts[address] = state
+	return 0, true
+}
+
+func (server *Server) recordLoginFailure(address string, now time.Time) {
+	server.loginMu.Lock()
+	defer server.loginMu.Unlock()
+	state := server.loginAttempts[address]
+	state.Failures++
+	shift := state.Failures - 1
+	if shift > 7 {
+		shift = 7
+	}
+	delay := 250 * time.Millisecond * time.Duration(1<<shift)
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
+	}
+	state.BlockedUntil = now.Add(delay)
+	server.loginAttempts[address] = state
+}
+
+func (server *Server) recordLoginSuccess(address string) {
+	server.loginMu.Lock()
+	delete(server.loginAttempts, address)
+	server.loginMu.Unlock()
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
@@ -521,14 +530,20 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-func sameOrigin(request *http.Request) bool {
+func (server *Server) sameOrigin(request *http.Request) bool {
 	origin := request.Header.Get("Origin")
 	if origin == "" {
 		return true
 	}
+	if configured := server.currentConfig().AdminPublicURL; configured != "" {
+		parsed, err := url.Parse(configured)
+		if err != nil {
+			return false
+		}
+		return origin == parsed.Scheme+"://"+parsed.Host
+	}
 	expectedHTTP := "http://" + request.Host
-	expectedHTTPS := "https://" + request.Host
-	return origin == expectedHTTP || origin == expectedHTTPS
+	return origin == expectedHTTP
 }
 
 func isJSON(request *http.Request) bool {

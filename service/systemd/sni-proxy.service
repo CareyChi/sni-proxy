@@ -18,7 +18,8 @@ AmbientCapabilities=
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=@CONFIG_DIR@ @DATA_DIR@ @LOG_DIR@
+ReadOnlyPaths=@CONFIG_DIR@
+ReadWritePaths=@DATA_DIR@ @LOG_DIR@
 
 [Install]
 WantedBy=multi-user.target

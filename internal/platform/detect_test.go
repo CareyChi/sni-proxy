@@ -38,12 +38,12 @@ func TestDetectAlpineOpenRC(t *testing.T) {
 
 func TestCompatibilityMatrixIDs(t *testing.T) {
 	for _, id := range []string{"debian", "ubuntu", "rocky", "almalinux", "fedora", "opensuse-leap", "arch", "alpine", "gentoo", "void"} {
-		if compatibilityFor(id) != "verified" {
-			t.Fatalf("expected %s to be verified", id)
+		if compatibilityFor(id) != "targeted" {
+			t.Fatalf("expected %s to be targeted", id)
 		}
 	}
-	if compatibilityFor("example-linux") != "generic" {
-		t.Fatal("unknown distribution must use generic compatibility")
+	if compatibilityFor("example-linux") != "recognized" {
+		t.Fatal("unknown but identified distribution must be recognized")
 	}
 }
 

@@ -7,38 +7,50 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"golang.org/x/crypto/argon2"
 )
 
 const (
-	credentialVersion = 1
-	defaultIterations = 210000
+	credentialVersion  = 2
+	algorithmArgon2id  = "argon2id"
+	defaultMemory      = 64 * 1024 // KiB
+	defaultTime        = 3
+	defaultParallelism = 2
+	defaultHashLength  = 32
+	generatedLength    = 20
+
+	legacyVersion    = 1
+	legacyIterations = 210000
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{3,64}$`)
 
 type Record struct {
-	Version    int    `json:"version"`
-	Username   string `json:"username"`
-	Salt       string `json:"salt"`
-	Hash       string `json:"hash"`
-	Iterations int    `json:"iterations"`
+	Version     int    `json:"version"`
+	Username    string `json:"username"`
+	Algorithm   string `json:"algorithm,omitempty"`
+	Memory      uint32 `json:"memory_kib,omitempty"`
+	Time        uint32 `json:"time,omitempty"`
+	Parallelism uint8  `json:"parallelism,omitempty"`
+	Salt        string `json:"salt"`
+	Hash        string `json:"hash"`
+
+	// Iterations exists only so installations using the version-1 custom KDF
+	// can authenticate long enough for an administrator to reset credentials.
+	Iterations int `json:"iterations,omitempty"`
 }
 
 type Store struct {
-	Path       string
-	MirrorPath string
+	Path string
 }
 
 func NewStore(dataDir string) Store {
-	return Store{
-		Path:       filepath.Join(dataDir, "credentials.json"),
-		MirrorPath: filepath.Join(dataDir, "credentials.mirror.json"),
-	}
+	return Store{Path: filepath.Join(dataDir, "credentials.json")}
 }
 
 func (store Store) Initialize(username, password string) (string, error) {
@@ -61,12 +73,11 @@ func (store Store) Reset(username, password string) (string, error) {
 	}
 	generated := ""
 	if password == "" {
-		value, err := GeneratePassword(10)
+		value, err := GeneratePassword(generatedLength)
 		if err != nil {
 			return "", err
 		}
-		password = value
-		generated = value
+		password, generated = value, value
 	}
 	if len(password) < 10 || len(password) > 256 {
 		return "", errors.New("password must be 10-256 bytes")
@@ -75,21 +86,14 @@ func (store Store) Reset(username, password string) (string, error) {
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return "", err
 	}
-	hash := derive(password, salt, defaultIterations)
+	hash := argon2.IDKey([]byte(password), salt, defaultTime, defaultMemory, defaultParallelism, defaultHashLength)
 	record := Record{
-		Version:    credentialVersion,
-		Username:   username,
-		Salt:       base64.RawStdEncoding.EncodeToString(salt),
-		Hash:       base64.RawStdEncoding.EncodeToString(hash),
-		Iterations: defaultIterations,
+		Version: credentialVersion, Username: username, Algorithm: algorithmArgon2id,
+		Memory: defaultMemory, Time: defaultTime, Parallelism: defaultParallelism,
+		Salt: base64.RawStdEncoding.EncodeToString(salt), Hash: base64.RawStdEncoding.EncodeToString(hash),
 	}
 	if err := writeRecordAtomic(store.Path, record); err != nil {
 		return "", err
-	}
-	if store.MirrorPath != "" {
-		if err := writeRecordAtomic(store.MirrorPath, record); err != nil {
-			return "", fmt.Errorf("primary credential updated but mirror sync failed: %w", err)
-		}
 	}
 	return generated, nil
 }
@@ -108,14 +112,22 @@ func (store Store) Verify(username, password string) (bool, error) {
 		return false, err
 	}
 	salt, err := base64.RawStdEncoding.DecodeString(record.Salt)
-	if err != nil {
+	if err != nil || len(salt) < 16 || len(salt) > 64 {
 		return false, errors.New("credential salt is corrupt")
 	}
 	want, err := base64.RawStdEncoding.DecodeString(record.Hash)
-	if err != nil {
+	if err != nil || len(want) < 16 || len(want) > 64 {
 		return false, errors.New("credential hash is corrupt")
 	}
-	got := derive(password, salt, record.Iterations)
+	var got []byte
+	switch record.Version {
+	case credentialVersion:
+		got = argon2.IDKey([]byte(password), salt, record.Time, record.Memory, record.Parallelism, uint32(len(want)))
+	case legacyVersion:
+		got = deriveLegacy(password, salt, record.Iterations)
+	default:
+		return false, errors.New("credential version is unsupported")
+	}
 	userEqual := subtle.ConstantTimeCompare([]byte(record.Username), []byte(username))
 	hashEqual := subtle.ConstantTimeCompare(want, got)
 	return userEqual&hashEqual == 1, nil
@@ -133,7 +145,22 @@ func (store Store) load() (Record, error) {
 	if err := decoder.Decode(&record); err != nil {
 		return Record{}, err
 	}
-	if record.Version != credentialVersion || !usernamePattern.MatchString(record.Username) || record.Iterations < 100000 || record.Iterations > 1000000 {
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return Record{}, errors.New("credential record must contain exactly one JSON object")
+	}
+	if !usernamePattern.MatchString(record.Username) {
+		return Record{}, errors.New("credential record is invalid")
+	}
+	switch record.Version {
+	case credentialVersion:
+		if record.Algorithm != algorithmArgon2id || record.Memory < 8*1024 || record.Memory > 256*1024 || record.Time < 1 || record.Time > 10 || record.Parallelism < 1 || record.Parallelism > 16 {
+			return Record{}, errors.New("Argon2id credential parameters are invalid")
+		}
+	case legacyVersion:
+		if record.Iterations < 100000 || record.Iterations > 1000000 {
+			return Record{}, errors.New("legacy credential parameters are invalid")
+		}
+	default:
 		return Record{}, errors.New("credential record is invalid")
 	}
 	return record, nil
@@ -161,7 +188,7 @@ func GeneratePassword(length int) (string, error) {
 	return string(value), nil
 }
 
-func derive(password string, salt []byte, iterations int) []byte {
+func deriveLegacy(password string, salt []byte, iterations int) []byte {
 	initial := sha256.New()
 	initial.Write(salt)
 	initial.Write([]byte(password))
@@ -191,6 +218,19 @@ func writeRecordAtomic(path string, record Record) error {
 			os.Remove(temporary)
 		}
 	}()
+	reference, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		reference, err = os.Stat(filepath.Dir(path))
+	}
+	if err != nil {
+		return err
+	}
+	// A root CLI reset must not turn the daemon-readable credential file into
+	// a root-owned file. Preserve the existing file owner, or for first-time
+	// initialization inherit the service-owned data directory's owner.
+	if err := matchOwnership(file, reference); err != nil {
+		return err
+	}
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}

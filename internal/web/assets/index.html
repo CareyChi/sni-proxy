@@ -62,25 +62,25 @@
       </section>
 
       <section class="page" data-page="service">
-        <div class="section-intro"><div><p class="eyebrow">SERVICE ADAPTER</p><h2>服务生命周期</h2><p>同一组操作会自动映射到 systemd、OpenRC、SysVinit 或 runit。</p></div></div>
+        <div class="section-intro"><div><p class="eyebrow">SERVICE ADAPTER</p><h2>服务生命周期</h2><p>Web 仅显示状态；高权限操作已禁用，请以 root 使用 sni-proxy service。</p></div></div>
         <div class="action-grid"><button class="action-card" data-service="start"><strong>启动应用</strong><span>启动核心代理与后台</span></button><button class="action-card" data-service="restart"><strong>重启应用</strong><span>平滑重新载入当前配置</span></button><button class="action-card danger" data-service="stop"><strong>停止应用</strong><span>停止当前服务</span></button><button class="action-card" data-service="enable"><strong>开启自启</strong><span>注册到当前 Init</span></button><button class="action-card" data-service="disable"><strong>关闭自启</strong><span>保留程序与配置</span></button></div>
       </section>
 
       <section class="page" data-page="network">
         <div class="section-intro"><div><p class="eyebrow">NETWORK</p><h2>端口与网络</h2><p>端口占用由 Go 直接试绑定，不依赖 ss、netstat 或 lsof。</p></div></div>
         <div class="two-column align-start">
-          <form class="panel form-panel" id="ports-form"><div class="panel-head"><div><h3>更换监听端口</h3><p>保存后通过当前 Service Adapter 重启。</p></div></div><label>HTTP 端口<input name="http_port" type="number" min="1" max="65535" required></label><label>HTTPS 端口<input name="https_port" type="number" min="1" max="65535" required></label><label>Web 端口<input name="web_port" type="number" min="1" max="65535" required></label><button class="primary" type="submit">校验并保存</button></form>
+          <form class="panel form-panel" id="ports-form"><div class="panel-head"><div><h3>监听端口</h3><p>Web 只读；请以 root 使用 sni-proxy config set-ports 执行带健康检查的事务修改。</p></div></div><label>HTTP 端口<input name="http_port" type="number" min="1" max="65535" required readonly></label><label>HTTPS 端口<input name="https_port" type="number" min="1" max="65535" required readonly></label><label>Web 端口<input name="web_port" type="number" min="1" max="65535" required readonly></label><button class="primary" type="submit" disabled>仅限 root CLI</button></form>
           <form class="panel form-panel" id="check-port-form"><div class="panel-head"><div><h3>检查端口</h3><p>对指定地址执行一次真实 Bind。</p></div></div><label>监听地址<input name="host" value="0.0.0.0"></label><label>端口<input name="port" type="number" min="1" max="65535" required></label><button class="secondary" type="submit">立即检查</button><div class="result-box" id="port-result">等待检查</div></form>
         </div>
       </section>
 
       <section class="page" data-page="credentials">
         <div class="section-intro"><div><p class="eyebrow">ACCESS</p><h2>管理员凭据</h2><p>密码哈希与随机盐保存在持久数据目录；新密码只显示一次。</p></div></div>
-        <form class="panel form-panel narrow" id="credentials-form"><label>管理员用户名<input name="username" autocomplete="username" required></label><label>新密码（留空自动生成 10 位密码）<input name="password" type="password" autocomplete="new-password"></label><button class="primary" type="submit">重置凭据</button><div class="secret-box hidden" id="generated-secret"><span>请立即保存新密码</span><strong id="generated-password"></strong></div></form>
+        <form class="panel form-panel narrow" id="credentials-form"><label>管理员用户名<input name="username" autocomplete="username" required></label><label>新密码（留空自动生成 20 位密码）<input name="password" type="password" autocomplete="new-password"></label><button class="primary" type="submit">重置凭据</button><div class="secret-box hidden" id="generated-secret"><span>请立即保存新密码</span><strong id="generated-password"></strong></div></form>
       </section>
 
       <section class="page" data-page="updates">
-        <div class="section-intro"><div><p class="eyebrow">RELEASES</p><h2>版本更新</h2><p>由 Go 解析 GitHub Release、校验 SHA-256，并保留回滚副本。</p></div></div>
+        <div class="section-intro"><div><p class="eyebrow">RELEASES</p><h2>版本更新</h2><p>Web 可检查版本；安装必须以 root CLI 验证 Ed25519 签名并执行自动回滚事务。</p></div></div>
         <article class="panel update-card"><div><span class="muted">已安装</span><strong id="update-current">—</strong></div><div class="update-arrow">→</div><div><span class="muted">可用版本</span><strong id="update-latest">尚未检查</strong></div><div class="update-actions"><button class="secondary" id="check-update-button">检测更新</button><button class="primary" id="apply-update-button" disabled>安装更新</button></div></article>
       </section>
 

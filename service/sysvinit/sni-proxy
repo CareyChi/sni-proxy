@@ -10,7 +10,6 @@
 
 NAME=sni-proxy
 DAEMON=@INSTALL_DIR@/bin/sni-proxy
-ARGS="serve --config @CONFIG_DIR@/config.json"
 USER=@SERVICE_USER@
 GROUP=@SERVICE_GROUP@
 PIDFILE=@DATA_DIR@/sni-proxy.pid
@@ -20,7 +19,7 @@ PIDFILE=@DATA_DIR@/sni-proxy.pid
 do_start() {
     command -v start-stop-daemon >/dev/null 2>&1 || { printf 'start-stop-daemon is required\n' >&2; return 1; }
     start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
-        --chuid "$USER:$GROUP" --chdir @DATA_DIR@ --exec "$DAEMON" -- $ARGS
+        --chuid "$USER:$GROUP" --chdir @DATA_DIR@ --exec "$DAEMON" -- serve --config @CONFIG_DIR@/config.json
 }
 
 do_stop() {

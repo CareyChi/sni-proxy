@@ -33,15 +33,116 @@ resolve_symlink() {
 
 is_safe_absolute_dir() {
     safe_dir=$1
+    case "/${safe_dir#/}/" in
+        */./*|*/../*|*'//'*) return 1 ;;
+    esac
+    [ "$safe_dir" = "${safe_dir%/}" ] || return 1
     case $safe_dir in
         ''|/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) return 1 ;;
-        /*) return 0 ;;
+        /*) canonicalize_dir "$safe_dir" >/dev/null ;;
         *) return 1 ;;
     esac
 }
 
 require_safe_install_dir() {
-    is_safe_absolute_dir "$1" || die "拒绝使用危险安装目录：${1:-<空>}"
+    canonical_managed_dir install "$1" >/dev/null || die "拒绝使用危险安装目录：${1:-<空>}"
+}
+
+canonicalize_dir() {
+    canonical_input=$1
+    case $canonical_input in /*) ;; *) return 1 ;; esac
+    case $canonical_input in *[!A-Za-z0-9_./-]*) return 1 ;; esac
+    case "/${canonical_input#/}/" in */./*|*/../*|*'//'*) return 1 ;; esac
+    [ "$canonical_input" = "${canonical_input%/}" ] || return 1
+    canonical_parent=$canonical_input
+    canonical_suffix=
+    while [ ! -e "$canonical_parent" ] && [ ! -L "$canonical_parent" ]; do
+        canonical_base=$(basename "$canonical_parent") || return 1
+        canonical_suffix=/$canonical_base$canonical_suffix
+        canonical_next=$(dirname "$canonical_parent") || return 1
+        [ "$canonical_next" != "$canonical_parent" ] || return 1
+        canonical_parent=$canonical_next
+    done
+    [ -d "$canonical_parent" ] || return 1
+    canonical_resolved=$(CDPATH= cd -P "$canonical_parent" 2>/dev/null && pwd -P) || return 1
+    [ "$canonical_resolved" != / ] || canonical_resolved=
+    printf '%s%s\n' "$canonical_resolved" "$canonical_suffix"
+}
+
+canonical_managed_dir() {
+    managed_role=$1
+    managed_input=$2
+    managed_canonical=$(canonicalize_dir "$managed_input") || return 1
+    case $managed_role:$managed_canonical in
+        install:/opt/*|install:/srv/*|install:/usr/local/lib/*) ;;
+        config:/etc/*) ;;
+        data:/var/lib/*) ;;
+        log:/var/log/*) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$managed_canonical"
+}
+
+path_contains() {
+    contains_parent=$1
+    contains_child=$2
+    [ "$contains_parent" = "$contains_child" ] && return 0
+    case $contains_child in "$contains_parent"/*) return 0 ;; *) return 1 ;; esac
+}
+
+paths_overlap() {
+    path_contains "$1" "$2" || path_contains "$2" "$1"
+}
+
+validate_managed_dirs() {
+    INSTALL_DIR=$(canonical_managed_dir install "$INSTALL_DIR") || return 1
+    CONFIG_DIR=$(canonical_managed_dir config "$CONFIG_DIR") || return 1
+    DATA_DIR=$(canonical_managed_dir data "$DATA_DIR") || return 1
+    LOG_DIR=$(canonical_managed_dir log "$LOG_DIR") || return 1
+    paths_overlap "$INSTALL_DIR" "$CONFIG_DIR" && return 1
+    paths_overlap "$INSTALL_DIR" "$DATA_DIR" && return 1
+    paths_overlap "$INSTALL_DIR" "$LOG_DIR" && return 1
+    paths_overlap "$CONFIG_DIR" "$DATA_DIR" && return 1
+    paths_overlap "$CONFIG_DIR" "$LOG_DIR" && return 1
+    paths_overlap "$DATA_DIR" "$LOG_DIR" && return 1
+    return 0
+}
+
+new_installation_id() {
+    command_exists od || return 1
+    installation_random=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+    case $installation_random in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#installation_random}" -eq 32 ] || return 1
+    printf '%s\n' "$installation_random"
+}
+
+write_managed_marker() {
+    marker_dir=$1
+    marker_role=$2
+    marker_id=$3
+    marker_file=$marker_dir/.sni-proxy-managed
+    marker_tmp=$marker_file.tmp
+    umask 022
+    {
+        printf '{"installation_id":"%s","role":"%s"}\n' "$marker_id" "$marker_role"
+    } > "$marker_tmp" || return 1
+    chown root:root "$marker_tmp" || return 1
+    chmod 644 "$marker_tmp" || return 1
+    mv "$marker_tmp" "$marker_file"
+}
+
+validate_managed_marker() {
+    marker_dir=$1
+    marker_role=$2
+    marker_id=$3
+    marker_file=$marker_dir/.sni-proxy-managed
+    [ -f "$marker_file" ] && [ ! -L "$marker_file" ] || return 1
+    [ "$(metadata_value "$marker_file" installation_id)" = "$marker_id" ] || return 1
+    [ "$(metadata_value "$marker_file" role)" = "$marker_role" ] || return 1
+    marker_uid=$(stat -c %u "$marker_file" 2>/dev/null) || return 1
+    marker_mode=$(stat -c %a "$marker_file" 2>/dev/null) || return 1
+    [ "$marker_uid" = 0 ] || return 1
+    case $marker_mode in 600|644) return 0 ;; *) return 1 ;; esac
 }
 
 find_nologin_shell() {

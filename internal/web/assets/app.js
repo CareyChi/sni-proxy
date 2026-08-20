@@ -1,7 +1,7 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
-const state = { status: null, platform: null, update: null };
+const state = { status: null, platform: null, update: null, privileged: false };
 const titles = { overview: "运行总览", service: "服务管理", network: "端口与网络", credentials: "管理员凭据", updates: "版本更新", system: "系统信息" };
 
 async function api(path, options = {}) {
@@ -44,6 +44,7 @@ async function refreshAll() {
   ]);
   state.status = status;
   state.platform = system.platform;
+  state.privileged = status.privileged_operations === true;
   setStateText($("#core-status"), status.core_running, status.core_status_known);
   setStateText($("#web-status"), status.web_running, true);
   $("#autostart-status").textContent = status.autostart_status_known ? (status.autostart_enabled ? "● 已开启" : "○ 已关闭") : "— 未知";
@@ -63,6 +64,8 @@ async function refreshAll() {
   form.elements.http_port.value = ports.http_port;
   form.elements.https_port.value = ports.https_port;
   form.elements.web_port.value = ports.web_port;
+  $$('[data-service]').forEach((button) => { button.disabled = !state.privileged; });
+  form.querySelector('button[type="submit"]').disabled = !state.privileged;
   $("#credentials-form").elements.username.value = credentials.username;
   $$('[data-fact]').forEach((element) => { element.textContent = system.platform[element.dataset.fact] ?? "—"; });
 }
@@ -143,7 +146,7 @@ $("#check-update-button").addEventListener("click", async () => {
   try {
     state.update = await api("/api/v1/update/check", { method: "POST", body: { channel: "stable" } });
     $("#update-latest").textContent = state.update.latest;
-    $("#apply-update-button").disabled = !state.update.available;
+    $("#apply-update-button").disabled = !state.privileged || !state.update.available;
     toast(state.update.available ? "发现新版本" : "当前已是最新版本");
   } catch (error) { toast(error.message, true); }
 });

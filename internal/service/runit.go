@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 )
 
@@ -16,7 +17,7 @@ func (manager *RunitManager) Name() string { return "runit" }
 
 func (manager *RunitManager) target() string {
 	if manager.serviceDir != "" {
-		return filepath.Join(manager.serviceDir, manager.serviceName)
+		return path.Join(manager.serviceDir, manager.serviceName)
 	}
 	for _, directory := range []string{"/var/service", "/run/service", "/etc/service"} {
 		if info, err := os.Stat(manager.rooted(directory)); err == nil && info.IsDir() {
@@ -69,7 +70,9 @@ func (manager *RunitManager) Enable(context.Context) error {
 	return os.Symlink(source, target)
 }
 
-func (manager *RunitManager) Disable(context.Context) error { return removeRegistration(manager.target()) }
+func (manager *RunitManager) Disable(context.Context) error {
+	return removeRegistration(manager.target())
+}
 
 func (manager *RunitManager) IsEnabled(context.Context) (bool, error) {
 	_, err := os.Lstat(manager.target())
@@ -87,4 +90,6 @@ func (manager *RunitManager) Install(context.Context) error {
 	return os.Chmod(runFile, 0o755)
 }
 
-func (manager *RunitManager) Uninstall(context.Context) error { return removeRegistration(manager.target()) }
+func (manager *RunitManager) Uninstall(context.Context) error {
+	return removeRegistration(manager.target())
+}

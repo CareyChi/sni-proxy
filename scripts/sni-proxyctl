@@ -71,24 +71,21 @@ change_ports() {
     printf 'HTTP 端口 [%s]：' "$old_http"; IFS= read -r new_http; [ -n "$new_http" ] || new_http=$old_http
     printf 'HTTPS 端口 [%s]：' "$old_https"; IFS= read -r new_https; [ -n "$new_https" ] || new_https=$old_https
     printf 'Web 端口 [%s]：' "$old_web"; IFS= read -r new_web; [ -n "$new_web" ] || new_web=$old_web
-    valid_port "$new_http" && valid_port "$new_https" && valid_port "$new_web" || { log_warn '端口必须在 1-65535。'; return 1; }
-    [ "$new_http" != "$new_https" ] && [ "$new_http" != "$new_web" ] && [ "$new_https" != "$new_web" ] || { log_warn '三个端口不能重复。'; return 1; }
-    [ "$new_http" = "$old_http" ] || network_check_port 0.0.0.0 "$new_http" || return 1
-    [ "$new_https" = "$old_https" ] || network_check_port 0.0.0.0 "$new_https" || return 1
-    [ "$new_web" = "$old_web" ] || network_check_port 0.0.0.0 "$new_web" || return 1
-    "$BINARY" config set-ports --http "$new_http" --https "$new_https" --web "$new_web" || return 1
-    if ! service_restart; then
-        log_warn '重启失败，正在回滚端口配置。'
-        "$BINARY" config set-ports --http "$old_http" --https "$old_https" --web "$old_web" >/dev/null 2>&1 || true
-        service_restart >/dev/null 2>&1 || true
+    if ! valid_port "$new_http" || ! valid_port "$new_https" || ! valid_port "$new_web"; then
+        log_warn '端口必须在 1-65535。'
         return 1
     fi
-    log_info '端口已更新。'
+    if [ "$new_http" = "$new_https" ] || [ "$new_http" = "$new_web" ] || [ "$new_https" = "$new_web" ]; then
+        log_warn '三个端口不能重复。'
+        return 1
+    fi
+    "$BINARY" config set-ports --http "$new_http" --https "$new_https" --web "$new_web" || return 1
+    log_info '端口已通过重启和健康检查事务更新。'
 }
 
 reset_credentials() {
     current_user=$("$BINARY" admin show-credentials 2>/dev/null | sed -n 's/^用户名：//p' | sed -n '1p')
-    [ -n "$current_user" ] || current_user=admin
+    [ -n "$current_user" ] || current_user='admin'
     printf '新用户名 [%s]：' "$current_user"; IFS= read -r new_user; [ -n "$new_user" ] || new_user=$current_user
     "$BINARY" admin reset-credentials --username "$new_user"
 }
@@ -98,7 +95,7 @@ run_choice() {
         1) update_check ;;
         2) network_show_info ;;
         3) if [ "$CORE_RUNNING" -eq 1 ]; then service_restart; else service_start; fi ;;
-        4) [ "$CORE_RUNNING" -eq 1 ] && service_stop || log_info '应用当前未运行。' ;;
+        4) if [ "$CORE_RUNNING" -eq 1 ]; then service_stop; else log_info '应用当前未运行。'; fi ;;
         5) change_ports ;;
         6) reset_credentials ;;
         7) if [ "$AUTOSTART_ENABLED" -eq 1 ]; then service_disable; else service_enable; fi ;;

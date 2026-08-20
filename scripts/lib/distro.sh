@@ -51,7 +51,7 @@ detect_distribution() {
     [ -n "$DISTRO_NAME" ] || DISTRO_NAME='Unknown Linux'
     [ -n "$DISTRO_VERSION" ] || DISTRO_VERSION=unknown
     case $DISTRO_ID in
-        debian|ubuntu|linuxmint|pop|kali|rhel|rocky|almalinux|centos|ol|fedora|opensuse*|sles|arch|manjaro|endeavouros|alpine|gentoo|devuan|void) COMPATIBILITY_MODE=verified ;;
+        debian|ubuntu|linuxmint|pop|kali|rhel|rocky|almalinux|centos|ol|fedora|opensuse*|sles|arch|manjaro|endeavouros|alpine|gentoo|devuan|void) COMPATIBILITY_MODE=targeted ;;
         *) COMPATIBILITY_MODE=generic ;;
     esac
 }
