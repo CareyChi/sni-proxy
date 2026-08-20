@@ -1,0 +1,11 @@
+#!/bin/sh
+
+cd @DATA_DIR@ || exit 1
+if command -v chpst >/dev/null 2>&1; then
+    exec chpst -u @SERVICE_USER@:@SERVICE_GROUP@ @INSTALL_DIR@/bin/sni-proxy serve --config @CONFIG_DIR@/config.json
+fi
+if command -v setuidgid >/dev/null 2>&1; then
+    exec setuidgid @SERVICE_USER@ @INSTALL_DIR@/bin/sni-proxy serve --config @CONFIG_DIR@/config.json
+fi
+printf 'runit requires chpst or setuidgid to drop privileges\n' >&2
+exit 1
