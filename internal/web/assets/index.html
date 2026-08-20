@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SNI Proxy 控制台</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <section class="login-shell" id="login-shell" aria-label="管理员登录">
+    <form class="login-card" id="login-form">
+      <div class="brand-mark" aria-hidden="true">S</div>
+      <p class="eyebrow">SECURE NETWORK CONTROL</p>
+      <h1>欢迎回来</h1>
+      <p class="muted">登录 SNI Proxy 管理后台</p>
+      <label>用户名<input name="username" autocomplete="username" value="admin" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="primary wide" type="submit">安全登录</button>
+      <p class="form-message" id="login-message" role="alert"></p>
+    </form>
+  </section>
+
+  <div class="app hidden" id="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark small">S</span><div><strong>SNI Proxy</strong><span>Control plane</span></div></div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-section="overview">总览</button>
+        <button class="nav-item" data-section="service">服务管理</button>
+        <button class="nav-item" data-section="network">端口与网络</button>
+        <button class="nav-item" data-section="credentials">管理员凭据</button>
+        <button class="nav-item" data-section="updates">版本更新</button>
+        <button class="nav-item" data-section="system">系统信息</button>
+      </nav>
+      <div class="sidebar-foot"><span class="live-dot"></span><span>Web 后台运行中</span></div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">OPERATIONS</p><h1 id="page-title">运行总览</h1></div>
+        <div class="top-actions"><button class="quiet" id="refresh-button">刷新状态</button><button class="avatar" id="logout-button" title="退出登录">AD</button></div>
+      </header>
+
+      <section class="page active" data-page="overview">
+        <div class="hero">
+          <div><span class="badge"><span class="live-dot"></span> CONTROL PLANE ONLINE</span><h2>一处看清代理与系统状态</h2><p>服务状态来自当前 Linux Init Adapter，安装目录与平台信息来自真实运行环境。</p></div>
+          <div class="hero-version"><span>当前版本</span><strong id="hero-version">—</strong></div>
+        </div>
+        <div class="metric-grid">
+          <article class="metric"><span>核心程序</span><strong id="core-status">读取中</strong><small id="core-detail">等待 Service Manager</small></article>
+          <article class="metric"><span>Web 后台</span><strong id="web-status">读取中</strong><small>健康端点实时反馈</small></article>
+          <article class="metric"><span>开机自启</span><strong id="autostart-status">读取中</strong><small id="init-summary">检测 Init System</small></article>
+          <article class="metric"><span>安装目录</span><strong class="path" id="install-dir">—</strong><small>解析实际可执行文件位置</small></article>
+        </div>
+        <div class="two-column">
+          <article class="panel"><div class="panel-head"><div><p class="eyebrow">ENDPOINTS</p><h3>监听端口</h3></div></div><div class="port-list"><div><span>HTTP</span><strong id="overview-http">—</strong></div><div><span>HTTPS / SNI</span><strong id="overview-https">—</strong></div><div><span>Web Console</span><strong id="overview-web">—</strong></div></div></article>
+          <article class="panel"><div class="panel-head"><div><p class="eyebrow">PLATFORM</p><h3>运行环境</h3></div></div><dl class="facts compact"><div><dt>发行版</dt><dd id="overview-distro">—</dd></div><div><dt>Init</dt><dd id="overview-init">—</dd></div><div><dt>架构</dt><dd id="overview-arch">—</dd></div></dl></article>
+        </div>
+      </section>
+
+      <section class="page" data-page="service">
+        <div class="section-intro"><div><p class="eyebrow">SERVICE ADAPTER</p><h2>服务生命周期</h2><p>同一组操作会自动映射到 systemd、OpenRC、SysVinit 或 runit。</p></div></div>
+        <div class="action-grid"><button class="action-card" data-service="start"><strong>启动应用</strong><span>启动核心代理与后台</span></button><button class="action-card" data-service="restart"><strong>重启应用</strong><span>平滑重新载入当前配置</span></button><button class="action-card danger" data-service="stop"><strong>停止应用</strong><span>停止当前服务</span></button><button class="action-card" data-service="enable"><strong>开启自启</strong><span>注册到当前 Init</span></button><button class="action-card" data-service="disable"><strong>关闭自启</strong><span>保留程序与配置</span></button></div>
+      </section>
+
+      <section class="page" data-page="network">
+        <div class="section-intro"><div><p class="eyebrow">NETWORK</p><h2>端口与网络</h2><p>端口占用由 Go 直接试绑定，不依赖 ss、netstat 或 lsof。</p></div></div>
+        <div class="two-column align-start">
+          <form class="panel form-panel" id="ports-form"><div class="panel-head"><div><h3>更换监听端口</h3><p>保存后通过当前 Service Adapter 重启。</p></div></div><label>HTTP 端口<input name="http_port" type="number" min="1" max="65535" required></label><label>HTTPS 端口<input name="https_port" type="number" min="1" max="65535" required></label><label>Web 端口<input name="web_port" type="number" min="1" max="65535" required></label><button class="primary" type="submit">校验并保存</button></form>
+          <form class="panel form-panel" id="check-port-form"><div class="panel-head"><div><h3>检查端口</h3><p>对指定地址执行一次真实 Bind。</p></div></div><label>监听地址<input name="host" value="0.0.0.0"></label><label>端口<input name="port" type="number" min="1" max="65535" required></label><button class="secondary" type="submit">立即检查</button><div class="result-box" id="port-result">等待检查</div></form>
+        </div>
+      </section>
+
+      <section class="page" data-page="credentials">
+        <div class="section-intro"><div><p class="eyebrow">ACCESS</p><h2>管理员凭据</h2><p>密码哈希与随机盐保存在持久数据目录；新密码只显示一次。</p></div></div>
+        <form class="panel form-panel narrow" id="credentials-form"><label>管理员用户名<input name="username" autocomplete="username" required></label><label>新密码（留空自动生成 10 位密码）<input name="password" type="password" autocomplete="new-password"></label><button class="primary" type="submit">重置凭据</button><div class="secret-box hidden" id="generated-secret"><span>请立即保存新密码</span><strong id="generated-password"></strong></div></form>
+      </section>
+
+      <section class="page" data-page="updates">
+        <div class="section-intro"><div><p class="eyebrow">RELEASES</p><h2>版本更新</h2><p>由 Go 解析 GitHub Release、校验 SHA-256，并保留回滚副本。</p></div></div>
+        <article class="panel update-card"><div><span class="muted">已安装</span><strong id="update-current">—</strong></div><div class="update-arrow">→</div><div><span class="muted">可用版本</span><strong id="update-latest">尚未检查</strong></div><div class="update-actions"><button class="secondary" id="check-update-button">检测更新</button><button class="primary" id="apply-update-button" disabled>安装更新</button></div></article>
+      </section>
+
+      <section class="page" data-page="system">
+        <div class="section-intro"><div><p class="eyebrow">LINUX PLATFORM</p><h2>真实系统信息</h2><p>发行版、内核、架构、Init 与安装目录均由后端能力检测。</p></div></div>
+        <article class="panel"><dl class="facts" id="system-facts"><div><dt>Linux Distribution</dt><dd data-fact="distribution">—</dd></div><div><dt>Distribution ID</dt><dd data-fact="distribution_id">—</dd></div><div><dt>Distribution Version</dt><dd data-fact="distribution_version">—</dd></div><div><dt>Kernel</dt><dd data-fact="kernel">—</dd></div><div><dt>Architecture</dt><dd data-fact="architecture">—</dd></div><div><dt>Init System</dt><dd data-fact="init_system">—</dd></div><div><dt>Service Manager</dt><dd data-fact="service_manager">—</dd></div><div><dt>Package Manager</dt><dd data-fact="package_manager">—</dd></div><div><dt>Install Directory</dt><dd class="path" data-fact="install_dir">—</dd></div><div><dt>Compatibility</dt><dd data-fact="compatibility">—</dd></div></dl></article>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

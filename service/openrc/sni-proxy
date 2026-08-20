@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+
+name="SNI Proxy"
+description="SNI and HTTP proxy with Web control plane"
+command="@INSTALL_DIR@/bin/sni-proxy"
+command_args="serve --config @CONFIG_DIR@/config.json"
+command_user="@SERVICE_USER@:@SERVICE_GROUP@"
+directory="@DATA_DIR@"
+pidfile="/run/sni-proxy/sni-proxy.pid"
+supervisor="supervise-daemon"
+output_log="@LOG_DIR@/sni-proxy.log"
+error_log="@LOG_DIR@/sni-proxy.err.log"
+respawn_delay=3
+respawn_max=0
+stop_timeout=30
+
+depend() {
+    need net
+}
+
+start_pre() {
+    checkpath --directory --mode 0750 --owner "@SERVICE_USER@:@SERVICE_GROUP@" /run/sni-proxy
+    checkpath --directory --mode 0750 --owner "@SERVICE_USER@:@SERVICE_GROUP@" "@DATA_DIR@" "@LOG_DIR@"
+}

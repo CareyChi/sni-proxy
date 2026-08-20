@@ -1,0 +1,47 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          sni-proxy
+# Required-Start:    $network $remote_fs
+# Required-Stop:     $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: SNI Proxy service
+### END INIT INFO
+
+NAME=sni-proxy
+DAEMON=@INSTALL_DIR@/bin/sni-proxy
+ARGS="serve --config @CONFIG_DIR@/config.json"
+USER=@SERVICE_USER@
+GROUP=@SERVICE_GROUP@
+PIDFILE=@DATA_DIR@/sni-proxy.pid
+
+[ -x "$DAEMON" ] || exit 5
+
+do_start() {
+    command -v start-stop-daemon >/dev/null 2>&1 || { printf 'start-stop-daemon is required\n' >&2; return 1; }
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile "$PIDFILE" \
+        --chuid "$USER:$GROUP" --chdir @DATA_DIR@ --exec "$DAEMON" -- $ARGS
+}
+
+do_stop() {
+    command -v start-stop-daemon >/dev/null 2>&1 || return 1
+    start-stop-daemon --stop --quiet --retry TERM/30/KILL/5 --pidfile "$PIDFILE" --exec "$DAEMON"
+    stop_status=$?
+    rm -f "$PIDFILE"
+    return "$stop_status"
+}
+
+case ${1:-} in
+    start) do_start ;;
+    stop) do_stop ;;
+    restart) do_stop; do_start ;;
+    status)
+        if [ -r "$PIDFILE" ] && kill -0 "$(sed -n '1p' "$PIDFILE")" 2>/dev/null; then
+            printf '%s is running\n' "$NAME"
+            exit 0
+        fi
+        printf '%s is not running\n' "$NAME"
+        exit 3
+        ;;
+    *) printf 'Usage: %s {start|stop|restart|status}\n' "$0" >&2; exit 2 ;;
+esac

@@ -1,0 +1,124 @@
+#!/bin/sh
+
+CONTROL_TARGET=$0
+case $CONTROL_TARGET in /*) ;; *) CONTROL_TARGET=$(pwd -P)/$CONTROL_TARGET ;; esac
+CONTROL_COUNT=0
+while [ -L "$CONTROL_TARGET" ]; do
+    CONTROL_COUNT=$((CONTROL_COUNT + 1))
+    [ "$CONTROL_COUNT" -le 40 ] || { printf '错误：管理脚本符号链接层级过深\n' >&2; exit 1; }
+    CONTROL_LINK=$(readlink "$CONTROL_TARGET") || { printf '错误：无法读取管理脚本符号链接\n' >&2; exit 1; }
+    case $CONTROL_LINK in /*) CONTROL_TARGET=$CONTROL_LINK ;; *) CONTROL_TARGET=$(dirname "$CONTROL_TARGET")/$CONTROL_LINK ;; esac
+done
+CONTROL_DIR=$(CDPATH= cd -P "$(dirname "$CONTROL_TARGET")" 2>/dev/null && pwd -P) || exit 1
+CONTROL_REAL=$CONTROL_DIR/$(basename "$CONTROL_TARGET")
+[ "$(basename "$CONTROL_DIR")" = bin ] || { printf '错误：无法从管理脚本真实路径确定安装目录：%s\n' "$CONTROL_REAL" >&2; exit 1; }
+INSTALL_DIR=$(dirname "$CONTROL_DIR")
+SCRIPT_LIB_DIR=$INSTALL_DIR/libexec
+
+[ -r "$SCRIPT_LIB_DIR/common.sh" ] || { printf '错误：安装目录缺少 libexec/common.sh\n' >&2; exit 1; }
+. "$SCRIPT_LIB_DIR/common.sh"
+. "$SCRIPT_LIB_DIR/distro.sh"
+. "$SCRIPT_LIB_DIR/service.sh"
+. "$SCRIPT_LIB_DIR/network.sh"
+. "$SCRIPT_LIB_DIR/update.sh"
+. "$SCRIPT_LIB_DIR/uninstall.sh"
+
+BINARY=$INSTALL_DIR/bin/sni-proxy
+[ -x "$BINARY" ] || die "核心程序不存在或不可执行：$BINARY"
+detect_distribution
+detect_init_system
+load_service_adapter || die "未检测到受支持的 Service Adapter"
+
+platform_field() { "$BINARY" platform --field "$1" 2>/dev/null || printf 'unknown\n'; }
+config_field() { "$BINARY" config get --key "$1" 2>/dev/null || printf '?\n'; }
+
+refresh_status() {
+    if service_is_running >/dev/null 2>&1; then CORE_RUNNING=1; CORE_STATUS='● 运行中'; else CORE_RUNNING=0; CORE_STATUS='○ 已停止'; fi
+    if "$BINARY" health --timeout 2s >/dev/null 2>&1; then WEB_STATUS='● 运行中'; else WEB_STATUS='○ 不可用'; fi
+    if service_is_enabled >/dev/null 2>&1; then AUTOSTART_ENABLED=1; AUTOSTART_STATUS='● 已开启'; else AUTOSTART_ENABLED=0; AUTOSTART_STATUS='○ 已关闭'; fi
+    PROGRAM_VERSION=$("$BINARY" version 2>/dev/null || printf unknown)
+    HTTP_PORT=$(config_field http_port)
+    HTTPS_PORT=$(config_field https_port)
+    WEB_PORT=$(config_field web_port)
+    PLATFORM_NAME=$(platform_field distribution)
+    PLATFORM_VERSION=$(platform_field distribution_version)
+}
+
+show_header() {
+    refresh_status
+    printf '\n========================================\n'
+    printf ' SNI Proxy 管理脚本\n'
+    printf '========================================\n'
+    printf ' 安装目录：%s\n' "$INSTALL_DIR"
+    printf ' 系统环境：%s %s / %s\n' "$PLATFORM_NAME" "$PLATFORM_VERSION" "$INIT_SYSTEM"
+    printf ' 核心程序：%s\n' "$CORE_STATUS"
+    printf ' Web 后台：%s\n' "$WEB_STATUS"
+    printf ' 开机自启：%s\n' "$AUTOSTART_STATUS"
+    printf ' 当前版本：%s\n' "$PROGRAM_VERSION"
+    printf ' HTTP端口：%s\n' "$HTTP_PORT"
+    printf ' HTTPS端口：%s\n' "$HTTPS_PORT"
+    printf ' Web端口：%s\n' "$WEB_PORT"
+    printf '========================================\n\n'
+}
+
+valid_port() {
+    case $1 in ''|*[!0-9]*) return 1 ;; esac
+    [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+change_ports() {
+    old_http=$(config_field http_port); old_https=$(config_field https_port); old_web=$(config_field web_port)
+    printf 'HTTP 端口 [%s]：' "$old_http"; IFS= read -r new_http; [ -n "$new_http" ] || new_http=$old_http
+    printf 'HTTPS 端口 [%s]：' "$old_https"; IFS= read -r new_https; [ -n "$new_https" ] || new_https=$old_https
+    printf 'Web 端口 [%s]：' "$old_web"; IFS= read -r new_web; [ -n "$new_web" ] || new_web=$old_web
+    valid_port "$new_http" && valid_port "$new_https" && valid_port "$new_web" || { log_warn '端口必须在 1-65535。'; return 1; }
+    [ "$new_http" != "$new_https" ] && [ "$new_http" != "$new_web" ] && [ "$new_https" != "$new_web" ] || { log_warn '三个端口不能重复。'; return 1; }
+    [ "$new_http" = "$old_http" ] || network_check_port 0.0.0.0 "$new_http" || return 1
+    [ "$new_https" = "$old_https" ] || network_check_port 0.0.0.0 "$new_https" || return 1
+    [ "$new_web" = "$old_web" ] || network_check_port 0.0.0.0 "$new_web" || return 1
+    "$BINARY" config set-ports --http "$new_http" --https "$new_https" --web "$new_web" || return 1
+    if ! service_restart; then
+        log_warn '重启失败，正在回滚端口配置。'
+        "$BINARY" config set-ports --http "$old_http" --https "$old_https" --web "$old_web" >/dev/null 2>&1 || true
+        service_restart >/dev/null 2>&1 || true
+        return 1
+    fi
+    log_info '端口已更新。'
+}
+
+reset_credentials() {
+    current_user=$("$BINARY" admin show-credentials 2>/dev/null | sed -n 's/^用户名：//p' | sed -n '1p')
+    [ -n "$current_user" ] || current_user=admin
+    printf '新用户名 [%s]：' "$current_user"; IFS= read -r new_user; [ -n "$new_user" ] || new_user=$current_user
+    "$BINARY" admin reset-credentials --username "$new_user"
+}
+
+run_choice() {
+    case $1 in
+        1) update_check ;;
+        2) network_show_info ;;
+        3) if [ "$CORE_RUNNING" -eq 1 ]; then service_restart; else service_start; fi ;;
+        4) [ "$CORE_RUNNING" -eq 1 ] && service_stop || log_info '应用当前未运行。' ;;
+        5) change_ports ;;
+        6) reset_credentials ;;
+        7) if [ "$AUTOSTART_ENABLED" -eq 1 ]; then service_disable; else service_enable; fi ;;
+        8) uninstall_sni_proxy; exit 0 ;;
+        0) exit 0 ;;
+        *) log_warn '无效选项。' ;;
+    esac
+}
+
+while :; do
+    show_header
+    printf '1. 检测更新\n'
+    printf '2. 获取后台信息\n'
+    if [ "$CORE_RUNNING" -eq 1 ]; then printf '3. 重启应用\n4. 停止应用\n'; else printf '3. 启动应用\n4. 停止应用\n'; fi
+    printf '5. 更换端口\n'
+    printf '6. 重置用户名和密码\n'
+    if [ "$AUTOSTART_ENABLED" -eq 1 ]; then printf '7. 关闭开机自启\n'; else printf '7. 开启开机自启\n'; fi
+    printf '8. 完全卸载\n0. 退出\n\n请选择：'
+    IFS= read -r menu_choice || exit 0
+    run_choice "$menu_choice"
+    printf '\n按 Enter 返回菜单...'
+    IFS= read -r _menu_pause || exit 0
+done
